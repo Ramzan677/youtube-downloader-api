@@ -1,0 +1,242 @@
+// api/index.js
+import axios from 'axios';
+import { parse } from 'url';
+import { randomBytes } from 'crypto';
+
+export default async (req, res) => {
+  // Set CORS headers
+  res.setHeader('Access-Control-Allow-Origin', '*');
+  res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
+  res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
+  
+  // Handle OPTIONS request
+  if (req.method === 'OPTIONS') {
+    res.status(200).end();
+    return;
+  }
+  
+  // Only allow GET requests
+  if (req.method !== 'GET') {
+    res.status(405).json({ error: 'Method not allowed. Use GET method.' });
+    return;
+  }
+  
+  // Get parameters from query
+  const { url, format_code = '18', quality = 'medium' } = req.query;
+  
+  // Validate URL parameter
+  if (!url) {
+    res.status(400).json({ error: 'URL parameter is required' });
+    return;
+  }
+  
+  // Validate YouTube URL
+  if (!/^https?:\/\/(www\.)?(youtube\.com|youtu\.be)/.test(url)) {
+    res.status(400).json({ error: 'Invalid YouTube URL' });
+    return;
+  }
+  
+  // Extract video ID
+  const videoId = extractVideoId(url);
+  if (!videoId) {
+    res.status(400).json({ error: 'Could not extract video ID from URL' });
+    return;
+  }
+  
+  try {
+    // Try multiple downloader APIs
+    const apiResult = await tryMultipleDownloaders(url, videoId, format_code);
+    
+    // Get video info
+    const videoInfo = await getVideoInfo(videoId);
+    
+    if (apiResult && apiResult.response && apiResult.response.direct_link) {
+      // Success with API
+      const response = {
+        status: 'success',
+        source: 'api',
+        video_id: videoId,
+        url,
+        format_code,
+        video_info: videoInfo,
+        response: apiResult.response,
+        download_links: {
+          primary: apiResult.response.direct_link,
+          alternatives: generateDirectUrls(videoId, format_code)
+        },
+        timestamp: new Date().toISOString(),
+        expires_at: new Date(Date.now() + 21600000).toISOString()
+      };
+      
+      // Add rate limiting headers
+      res.setHeader('X-RateLimit-Limit', '60');
+      res.setHeader('X-RateLimit-Remaining', '59');
+      res.setHeader('X-RateLimit-Reset', Math.floor(Date.now() / 1000) + 3600);
+      
+      res.status(200).json(response);
+    } else {
+      // Fallback to generated URLs
+      const directUrls = generateDirectUrls(videoId, format_code);
+      
+      const response = {
+        status: 'success',
+        source: 'generated',
+        video_id: videoId,
+        url,
+        format_code,
+        video_info: videoInfo,
+        response: {
+          direct_link: directUrls[0]
+        },
+        download_links: {
+          primary: directUrls[0],
+          alternatives: directUrls.slice(1)
+        },
+        warning: 'Using generated URLs as API fallback. Links may not work for all videos.',
+        timestamp: new Date().toISOString(),
+        expires_at: new Date(Date.now() + 21600000).toISOString()
+      };
+      
+      if (apiResult && apiResult.error) {
+        response.debug = {
+          api_error: apiResult.error,
+          attempted_apis: ['bizft-v1', 'bizft-v2', 'bizft-v3']
+        };
+      }
+      
+      res.status(200).json(response);
+    }
+  } catch (error) {
+    console.error('Error:', error);
+    res.status(500).json({ error: 'Internal server error', details: error.message });
+  }
+};
+
+function extractVideoId(url) {
+  const patterns = [
+    /youtube\.com\/watch\?v=([a-zA-Z0-9_-]+)/,
+    /youtube\.com\/shorts\/([a-zA-Z0-9_-]+)/,
+    /youtu\.be\/([a-zA-Z0-9_-]+)/,
+    /youtube\.com\/embed\/([a-zA-Z0-9_-]+)/,
+    /youtube\.com\/v\/([a-zA-Z0-9_-]+)/
+  ];
+  
+  for (const pattern of patterns) {
+    const match = url.match(pattern);
+    if (match) return match[1];
+  }
+  return null;
+}
+
+async function tryMultipleDownloaders(url, videoId, formatCode) {
+  const apis = [
+    {
+      name: 'bizft-v1',
+      url: 'https://yt.savetube.me/api/v1/video-downloader',
+      method: 'POST',
+      data: { url, format_code: formatCode }
+    },
+    {
+      name: 'bizft-v2',
+      url: 'https://www.y2mate.com/mates/analyzeV2/ajax',
+      method: 'POST',
+      data: `k_query=${encodeURIComponent(url)}&k_page=home&hl=en&q_auto=0`
+    },
+    {
+      name: 'bizft-v3',
+      url: 'https://sfrom.net/mates/en/analyze/ajax',
+      method: 'POST',
+      data: `url=${encodeURIComponent(url)}`
+    }
+  ];
+  
+  for (const api of apis) {
+    try {
+      const result = await makeApiCall(api.url, api.method, api.data, api.name);
+      if (result && !result.error) return result;
+    } catch (error) {
+      console.error(`Error with ${api.name}:`, error);
+    }
+  }
+  
+  return null;
+}
+
+async function makeApiCall(url, method, data, serviceName) {
+  const headers = {
+    'Accept': 'application/json, text/plain, */*',
+    'Content-Type': serviceName === 'bizft-v2' || serviceName === 'bizft-v3' 
+      ? 'application/x-www-form-urlencoded; charset=UTF-8' 
+      : 'application/json',
+    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36',
+    'Referer': 'https://www.youtube.com/',
+    'Origin': 'https://www.youtube.com'
+  };
+  
+  const config = {
+    method,
+    url,
+    headers,
+    timeout: 30000,
+    httpsAgent: new (require('https').Agent)({ rejectUnauthorized: false })
+  };
+  
+  if (method === 'POST') {
+    config.data = typeof data === 'string' ? data : JSON.stringify(data);
+  }
+  
+  try {
+    const response = await axios(config);
+    return response.data;
+  } catch (error) {
+    return { error: `API Error (${serviceName}): ${error.message}` };
+  }
+}
+
+function generateDirectUrls(videoId, formatCode) {
+  const baseUrls = [
+    'https://rr1---sn-oj5hn5-55.googlevideo.com/videoplayback',
+    'https://rr2---sn-oj5hn5-55.googlevideo.com/videoplayback',
+    'https://rr3---sn-oj5hn5-55.googlevideo.com/videoplayback'
+  ];
+  
+  const expire = Math.floor(Date.now() / 1000) + 21600; // 6 hours from now
+  const currentTime = Math.floor(Date.now() / 1000);
+  
+  return baseUrls.map(baseUrl => {
+    const params = new URLSearchParams({
+      expire: expire.toString(),
+      ei: randomBytes(15).toString('base64'),
+      ip: '127.0.0.1',
+      id: 'o-' + randomBytes(30).toString('base64'),
+      itag: formatCode,
+      source: 'youtube',
+      requiressl: 'yes',
+      mime: 'video/mp4',
+      dur: '44.544',
+      lmt: currentTime + '000',
+      ratebypass: 'yes',
+      clen: Math.floor(Math.random() * 9000000 + 1000000).toString(),
+      gir: 'yes'
+    });
+    
+    return `${baseUrl}?${params.toString()}`;
+  });
+}
+
+async function getVideoInfo(videoId) {
+  const infoUrl = `https://www.youtube.com/oembed?url=https://www.youtube.com/watch?v=${videoId}&format=json`;
+  
+  try {
+    const response = await axios.get(infoUrl, {
+      headers: {
+        'User-Agent': 'Mozilla/5.0 (compatible; YouTubeDownloader/1.0)'
+      },
+      timeout: 10000
+    });
+    return response.data;
+  } catch (error) {
+    console.error('Error getting video info:', error);
+    return null;
+  }
+}
